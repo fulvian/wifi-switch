@@ -89,3 +89,25 @@ class TestGetCurrentNetwork:
         mock = MagicMock(returncode=1, stdout="")
         with patch("subprocess.run", return_value=mock):
             assert ws.get_current_network() == ""
+
+
+class TestSwitchNetwork:
+    def test_returns_true_on_successful_connect(self):
+        mock = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock):
+            assert ws.switch_network("Redmi 9A") is True
+
+    def test_returns_false_when_nmcli_fails(self):
+        mock = MagicMock(returncode=1)
+        with patch("subprocess.run", return_value=mock):
+            assert ws.switch_network("Redmi 9A") is False
+
+    def test_calls_nmcli_with_ssid_and_interface(self):
+        mock = MagicMock(returncode=0)
+        with patch("subprocess.run", return_value=mock) as mock_run:
+            ws.switch_network("Redmi 9A")
+        args = mock_run.call_args[0][0]
+        assert "nmcli" in args
+        assert "connect" in args
+        assert "Redmi 9A" in args
+        assert ws.INTERFACE in args

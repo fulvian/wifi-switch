@@ -65,7 +65,12 @@ def get_current_network() -> str:
 
 
 def switch_network(ssid: str) -> bool:
-    raise NotImplementedError
+    result = subprocess.run(
+        ["nmcli", "device", "wifi", "connect", ssid, "ifname", INTERFACE],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
 
 
 def main() -> None:
