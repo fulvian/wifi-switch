@@ -43,11 +43,25 @@ def check_connectivity() -> bool:
 
 
 def get_available_networks() -> list[str]:
-    raise NotImplementedError
+    result = subprocess.run(
+        ["nmcli", "-t", "-f", "SSID", "device", "wifi", "list", "ifname", INTERFACE],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 def get_current_network() -> str:
-    raise NotImplementedError
+    result = subprocess.run(
+        ["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", INTERFACE],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
 
 
 def switch_network(ssid: str) -> bool:
