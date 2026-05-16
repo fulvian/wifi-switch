@@ -13,7 +13,13 @@ class TestCheckConnectivity:
         with patch("subprocess.run", return_value=mock):
             assert ws.check_connectivity() is True
 
-    def test_returns_false_when_http_status_not_200(self):
+    def test_returns_true_when_curl_responds_204(self):
+        # connectivity-check.ubuntu.com returns 204, not 200
+        mock = MagicMock(returncode=0, stdout="204")
+        with patch("subprocess.run", return_value=mock):
+            assert ws.check_connectivity() is True
+
+    def test_returns_false_when_http_status_not_200_or_204(self):
         mock = MagicMock(returncode=0, stdout="000")
         with patch("subprocess.run", return_value=mock):
             assert ws.check_connectivity() is False

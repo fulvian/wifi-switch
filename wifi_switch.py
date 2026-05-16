@@ -39,7 +39,8 @@ def check_connectivity() -> bool:
         capture_output=True,
         text=True,
     )
-    return result.returncode == 0 and result.stdout.strip() == "200"
+    code = result.stdout.strip()
+    return result.returncode == 0 and code in ("200", "204")
 
 
 def get_available_networks() -> list[str]:
