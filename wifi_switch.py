@@ -27,7 +27,19 @@ def log(level: str, msg: str) -> None:
 
 
 def check_connectivity() -> bool:
-    raise NotImplementedError
+    result = subprocess.run(
+        [
+            "curl",
+            "--interface", INTERFACE,
+            "--max-time", str(CHECK_TIMEOUT),
+            "-s", "-o", "/dev/null",
+            "-w", "%{http_code}",
+            CHECK_URL,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "200"
 
 
 def get_available_networks() -> list[str]:
