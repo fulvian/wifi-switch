@@ -111,3 +111,95 @@ class TestSwitchNetwork:
         assert "connect" in args
         assert "Redmi 9A" in args
         assert ws.INTERFACE in args
+
+
+class TestMainLoop:
+    """Tests run main() for a fixed number of iterations by raising
+    StopIteration after N calls to time.sleep to break the infinite loop."""
+
+    def _run_main(self, side_effects_check, side_effects_available,
+                  side_effects_switch, current_network, iterations=1):
+        """Helper: runs main() for `iterations` sleep calls then stops."""
+        sleep_calls = []
+
+        def fake_sleep(n):
+            sleep_calls.append(n)
+            if len(sleep_calls) >= iterations:
+                raise StopIteration
+
+        with patch("wifi_switch.get_current_network", return_value=current_network), \
+             patch("wifi_switch.check_connectivity", side_effect=side_effects_check), \
+             patch("wifi_switch.get_available_networks", side_effect=side_effects_available), \
+             patch("wifi_switch.switch_network", side_effect=side_effects_switch), \
+             patch("time.sleep", side_effect=fake_sleep):
+            try:
+                ws.main()
+            except StopIteration:
+                pass
+        return sleep_calls
+
+    def test_switches_down_after_fail_threshold(self):
+        # 2 failures → switch to Redmi 9A
+        sleep_calls = self._run_main(
+            side_effects_check=[False, False],
+            side_effects_available=[["Redmi 9A"], ["Redmi 9A"]],
+            side_effects_switch=[True],
+            current_network="Ventura's Home_EXT",
+            iterations=3,  # 2 CHECK_INTERVAL sleeps + 1 STABILIZE_WAIT sleep
+        )
+        # third sleep is STABILIZE_WAIT (15), not CHECK_INTERVAL (10)
+        assert ws.STABILIZE_WAIT in sleep_calls
+
+    def test_does_not_switch_before_fail_threshold(self):
+        # only 1 failure → no switch
+        with patch("wifi_switch.get_current_network", return_value="Ventura's Home_EXT"), \
+             patch("wifi_switch.check_connectivity", return_value=False), \
+             patch("wifi_switch.switch_network") as mock_switch, \
+             patch("time.sleep", side_effect=[StopIteration()]):
+            try:
+                ws.main()
+            except StopIteration:
+                pass
+        mock_switch.assert_not_called()
+
+    def test_switches_up_after_success_threshold(self):
+        # on Redmi 9A, 3 successes with Ventura in range → switch up
+        sleep_calls = self._run_main(
+            side_effects_check=[True, True, True],
+            side_effects_available=[
+                ["Ventura's Home_EXT", "Redmi 9A"],
+                ["Ventura's Home_EXT", "Redmi 9A"],
+                ["Ventura's Home_EXT", "Redmi 9A"],
+            ],
+            side_effects_switch=[True],
+            current_network="Redmi 9A",
+            iterations=4,
+        )
+        assert ws.STABILIZE_WAIT in sleep_calls
+
+    def test_does_not_switch_up_if_better_not_in_range(self):
+        # on Redmi 9A, 3 successes but Ventura NOT in scan → no switch
+        with patch("wifi_switch.get_current_network", return_value="Redmi 9A"), \
+             patch("wifi_switch.check_connectivity", return_value=True), \
+             patch("wifi_switch.get_available_networks", return_value=["Redmi 9A"]), \
+             patch("wifi_switch.switch_network") as mock_switch, \
+             patch("time.sleep", side_effect=[None, None, None, StopIteration()]):
+            try:
+                ws.main()
+            except StopIteration:
+                pass
+        mock_switch.assert_not_called()
+
+    def test_skips_unavailable_fallback_and_tries_next(self):
+        # Ventura fails, Redmi NOT in scan → should try POCO X6
+        with patch("wifi_switch.get_current_network", return_value="Ventura's Home_EXT"), \
+             patch("wifi_switch.check_connectivity", return_value=False), \
+             patch("wifi_switch.get_available_networks",
+                   return_value=["POCO X6 5G di Fulvio"]), \
+             patch("wifi_switch.switch_network") as mock_switch, \
+             patch("time.sleep", side_effect=[None, None, StopIteration()]):
+            try:
+                ws.main()
+            except StopIteration:
+                pass
+        mock_switch.assert_called_once_with("POCO X6 5G di Fulvio")

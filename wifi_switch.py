@@ -74,7 +74,69 @@ def switch_network(ssid: str) -> bool:
 
 
 def main() -> None:
-    raise NotImplementedError
+    current = get_current_network()
+    log("INFO", f"Avviato su {current!r}")
+
+    failure_count = 0
+    success_count = 0
+
+    while True:
+        ok = check_connectivity()
+
+        try:
+            current_idx = NETWORKS.index(current)
+        except ValueError:
+            current_idx = len(NETWORKS)
+
+        if ok:
+            failure_count = 0
+            success_count += 1
+            log("INFO", f"Connettività OK su {current!r} (success #{success_count})")
+
+            if current_idx > 0:
+                available = get_available_networks()
+                better = next(
+                    (n for n in NETWORKS[:current_idx] if n in available), None
+                )
+                if better and success_count >= SUCCESS_THRESHOLD:
+                    log("INFO",
+                        f"Success #{success_count} su {current!r} — "
+                        f"{better!r} in range, switch up")
+                    if switch_network(better):
+                        current = better
+                        log("INFO", f"Connesso a {current!r} — monitoraggio attivo")
+                    else:
+                        log("ERROR", f"nmcli connect a {better!r} fallito")
+                    failure_count = 0
+                    success_count = 0
+                    time.sleep(STABILIZE_WAIT)
+                    continue
+
+        else:
+            success_count = 0
+            failure_count += 1
+            log("WARN", f"Fail #{failure_count} su {current!r}")
+
+            if failure_count >= FAIL_THRESHOLD:
+                available = get_available_networks()
+                candidates = NETWORKS[current_idx + 1:] if current_idx < len(NETWORKS) else NETWORKS
+                target = next((n for n in candidates if n in available), None)
+                if target:
+                    log("WARN",
+                        f"Fail #{failure_count} — switch a {target!r}")
+                    if switch_network(target):
+                        current = target
+                        log("INFO", f"Connesso a {current!r} — monitoraggio attivo")
+                    else:
+                        log("ERROR", f"nmcli connect a {target!r} fallito")
+                    failure_count = 0
+                    success_count = 0
+                    time.sleep(STABILIZE_WAIT)
+                    continue
+                else:
+                    log("ERROR", "Nessuna rete fallback disponibile")
+
+        time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
