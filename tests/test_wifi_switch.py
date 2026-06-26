@@ -2,8 +2,11 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, mock_open
 import pytest
+import time
+import json
+import tempfile
 import wifi_switch as ws
 
 
@@ -146,50 +149,27 @@ class TestMainLoop:
 
     def test_switches_down_after_fail_threshold(self):
         # 2 failures → switch to Redmi 9A
-        sleep_calls = self._run_main(
-            side_effects_check=[False, False],
-            side_effects_available=[["Redmi 9A"], ["Redmi 9A"]],
-            side_effects_switch=[True],
-            current_network="Ventura's Home_EXT",
-            iterations=3,  # 2 CHECK_INTERVAL sleeps + 1 STABILIZE_WAIT sleep
-        )
-        # third sleep is STABILIZE_WAIT (15), not CHECK_INTERVAL (10)
-        assert ws.STABILIZE_WAIT in sleep_calls
+        with patch("wifi_switch.get_current_network", return_value="Ventura's Home_EXT"), \
+             patch("wifi_switch.check_connectivity", side_effect=[False, False]), \
+             patch("wifi_switch.read_net_state_file", return_value=None), \
+             patch("wifi_switch.get_available_networks", side_effect=[["Redmi 9A"], ["Redmi 9A"]]), \
+             patch("wifi_switch.switch_network", return_value=True) as mock_switch, \
+             patch("wifi_switch.write_wifi_state"), \
+             patch("time.sleep", side_effect=[None, None, StopIteration()]):
+            try:
+                ws.main()
+            except StopIteration:
+                pass
+        mock_switch.assert_called_once()
 
     def test_does_not_switch_before_fail_threshold(self):
         # only 1 failure → no switch
         with patch("wifi_switch.get_current_network", return_value="Ventura's Home_EXT"), \
              patch("wifi_switch.check_connectivity", return_value=False), \
+             patch("wifi_switch.read_net_state_file", return_value=None), \
              patch("wifi_switch.switch_network") as mock_switch, \
+             patch("wifi_switch.write_wifi_state"), \
              patch("time.sleep", side_effect=[StopIteration()]):
-            try:
-                ws.main()
-            except StopIteration:
-                pass
-        mock_switch.assert_not_called()
-
-    def test_switches_up_after_success_threshold(self):
-        # on Redmi 9A, 3 successes with Ventura in range → switch up
-        sleep_calls = self._run_main(
-            side_effects_check=[True, True, True],
-            side_effects_available=[
-                ["Ventura's Home_EXT", "Redmi 9A"],
-                ["Ventura's Home_EXT", "Redmi 9A"],
-                ["Ventura's Home_EXT", "Redmi 9A"],
-            ],
-            side_effects_switch=[True],
-            current_network="Redmi 9A",
-            iterations=4,
-        )
-        assert ws.STABILIZE_WAIT in sleep_calls
-
-    def test_does_not_switch_up_if_better_not_in_range(self):
-        # on Redmi 9A, 3 successes but Ventura NOT in scan → no switch
-        with patch("wifi_switch.get_current_network", return_value="Redmi 9A"), \
-             patch("wifi_switch.check_connectivity", return_value=True), \
-             patch("wifi_switch.get_available_networks", return_value=["Redmi 9A"]), \
-             patch("wifi_switch.switch_network") as mock_switch, \
-             patch("time.sleep", side_effect=[None, None, None, StopIteration()]):
             try:
                 ws.main()
             except StopIteration:
@@ -200,12 +180,184 @@ class TestMainLoop:
         # Ventura fails, Redmi NOT in scan → should try POCO X6
         with patch("wifi_switch.get_current_network", return_value="Ventura's Home_EXT"), \
              patch("wifi_switch.check_connectivity", return_value=False), \
+             patch("wifi_switch.read_net_state_file", return_value=None), \
              patch("wifi_switch.get_available_networks",
                    return_value=["POCO X6 5G di Fulvio"]), \
              patch("wifi_switch.switch_network") as mock_switch, \
+             patch("wifi_switch.write_wifi_state"), \
              patch("time.sleep", side_effect=[None, None, StopIteration()]):
             try:
                 ws.main()
             except StopIteration:
                 pass
         mock_switch.assert_called_once_with("POCO X6 5G di Fulvio")
+
+    def test_sticky_failover_never_switches_up(self):
+        """Once on a network with internet, stay. Never switch to 'better' network."""
+        # Current: "Redmi 9A" (working); available: "Ventura's Home_EXT" (preferred, ranked first)
+        with patch("wifi_switch.get_current_network", return_value="Redmi 9A"), \
+             patch("wifi_switch.check_connectivity", return_value=True), \
+             patch("wifi_switch.get_available_networks",
+                   return_value=["Ventura's Home_EXT", "Redmi 9A"]), \
+             patch("wifi_switch.switch_network") as mock_switch, \
+             patch("wifi_switch.write_wifi_state"), \
+             patch("time.sleep", side_effect=[StopIteration()]):
+            try:
+                ws.main()
+            except StopIteration:
+                pass
+        # Must NOT call switch_network (no switch-UP logic)
+        mock_switch.assert_not_called()
+
+    def test_freeze_flag_prevents_switch(self):
+        """FROZEN flag (fresh, within TTL) blocks any switch action."""
+        fresh_ts = time.time()
+        frozen_state = {"owner": "texbot", "mode": "FROZEN", "ts": fresh_ts}
+
+        with patch("wifi_switch.get_current_network", return_value="Redmi 9A"), \
+             patch("wifi_switch.check_connectivity", return_value=False), \
+             patch("wifi_switch.get_available_networks", return_value=["POCO X6 5G di Fulvio"]), \
+             patch("wifi_switch.read_net_state_file", return_value=frozen_state), \
+             patch("wifi_switch.switch_network") as mock_switch, \
+             patch("wifi_switch.write_wifi_state"), \
+             patch("time.sleep", side_effect=[None, StopIteration()]):
+            try:
+                ws.main()
+            except StopIteration:
+                pass
+        # Must NOT call switch (freeze active)
+        mock_switch.assert_not_called()
+
+    def test_stale_freeze_flag_allows_switch(self):
+        """Stale FROZEN flag (past TTL) does NOT block switching."""
+        old_ts = time.time() - 35.0  # 35s old, past 30s TTL
+        stale_frozen = {"owner": "texbot", "mode": "FROZEN", "ts": old_ts}
+
+        with patch("wifi_switch.get_current_network", return_value="Redmi 9A"), \
+             patch("wifi_switch.check_connectivity", return_value=False), \
+             patch("wifi_switch.get_available_networks", return_value=["POCO X6 5G di Fulvio"]), \
+             patch("wifi_switch.read_net_state_file", return_value=stale_frozen), \
+             patch("wifi_switch.switch_network", return_value=True) as mock_switch, \
+             patch("wifi_switch.write_wifi_state"), \
+             patch("time.sleep", side_effect=[None, None, StopIteration()]):
+            try:
+                ws.main()
+            except StopIteration:
+                pass
+        # Must call switch (stale flag does not block)
+        mock_switch.assert_called_once()
+
+    def test_publishes_wifi_state_on_each_iteration(self):
+        """After each iteration, publish own state (stable-on:<ssid>)."""
+        with patch("wifi_switch.get_current_network", return_value="Redmi 9A"), \
+             patch("wifi_switch.check_connectivity", return_value=True), \
+             patch("wifi_switch.read_net_state_file", return_value=None), \
+             patch("wifi_switch.write_wifi_state") as mock_write, \
+             patch("time.sleep", side_effect=[StopIteration()]):
+            try:
+                ws.main()
+            except StopIteration:
+                pass
+        # Must call write_wifi_state at least once with current ssid
+        mock_write.assert_called()
+        # Check that it was called with the current network
+        call_args = mock_write.call_args
+        assert call_args is not None
+        assert call_args[0][0] == "Redmi 9A"
+
+
+class TestReadNetStateFile:
+    def test_returns_dict_when_file_exists(self):
+        data = {"owner": "texbot", "mode": "FROZEN", "ts": 123.45}
+        with patch("builtins.open", mock_open(read_data=json.dumps(data))):
+            result = ws.read_net_state_file("/fake/path.json")
+        assert result == data
+
+    def test_returns_none_when_file_missing(self):
+        with patch("builtins.open", side_effect=FileNotFoundError):
+            result = ws.read_net_state_file("/fake/path.json")
+        assert result is None
+
+    def test_returns_none_when_json_invalid(self):
+        with patch("builtins.open", mock_open(read_data="invalid json {{")):
+            result = ws.read_net_state_file("/fake/path.json")
+        assert result is None
+
+    def test_returns_none_on_oserror(self):
+        with patch("builtins.open", side_effect=OSError("permission denied")):
+            result = ws.read_net_state_file("/fake/path.json")
+        assert result is None
+
+
+class TestIsFreezeActive:
+    def test_returns_true_when_fresh_frozen_flag(self):
+        fresh_ts = time.time()
+        state = {"owner": "texbot", "mode": "FROZEN", "ts": fresh_ts}
+        assert ws.is_freeze_active(state) is True
+
+    def test_returns_false_when_stale_frozen_flag(self):
+        old_ts = time.time() - 35.0  # 35s old, past 30s TTL
+        state = {"owner": "texbot", "mode": "FROZEN", "ts": old_ts}
+        assert ws.is_freeze_active(state) is False
+
+    def test_returns_false_when_state_is_none(self):
+        assert ws.is_freeze_active(None) is False
+
+    def test_returns_false_when_owner_not_texbot(self):
+        state = {"owner": "other", "mode": "FROZEN", "ts": time.time()}
+        assert ws.is_freeze_active(state) is False
+
+    def test_returns_false_when_mode_not_frozen(self):
+        state = {"owner": "texbot", "mode": "RUNNING", "ts": time.time()}
+        assert ws.is_freeze_active(state) is False
+
+    def test_returns_false_when_ts_missing(self):
+        state = {"owner": "texbot", "mode": "FROZEN"}
+        assert ws.is_freeze_active(state) is False
+
+
+class TestWriteWifiState:
+    def test_writes_state_with_stable_on_prefix(self):
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as f:
+            tmp_path = f.name
+
+        try:
+            ws.write_wifi_state("Redmi 9A", path=tmp_path)
+            with open(tmp_path, 'r') as f:
+                data = json.load(f)
+            assert "wifi" in data
+            assert "Redmi 9A" in data["wifi"]["state"]
+            assert "stable-on:" in data["wifi"]["state"]
+            assert "ts" in data["wifi"]
+        finally:
+            os.unlink(tmp_path)
+
+    def test_merges_with_existing_state(self):
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as f:
+            tmp_path = f.name
+            json.dump({"owner": "texbot", "mode": "FROZEN"}, f)
+
+        try:
+            ws.write_wifi_state("POCO X6 5G di Fulvio", path=tmp_path)
+            with open(tmp_path, 'r') as f:
+                data = json.load(f)
+            assert data["owner"] == "texbot"
+            assert data["mode"] == "FROZEN"
+            assert "wifi" in data
+            assert "POCO X6 5G di Fulvio" in data["wifi"]["state"]
+        finally:
+            os.unlink(tmp_path)
+
+    def test_uses_atomic_write(self):
+        with patch("builtins.open", mock_open()), \
+             patch("os.replace") as mock_replace:
+            ws.write_wifi_state("Redmi 9A", path="/fake/path.json")
+        # Verify that os.replace was called (atomic write pattern)
+        mock_replace.assert_called()
+
+    def test_logs_on_oserror(self):
+        with patch("builtins.open", side_effect=OSError("permission denied")), \
+             patch("wifi_switch.log") as mock_log:
+            ws.write_wifi_state("Redmi 9A", path="/fake/path.json")
+        # Verify that error was logged
+        mock_log.assert_called()

@@ -5,6 +5,8 @@ networks when the current one loses internet access."""
 import subprocess
 import time
 import sys
+import json
+import os
 from datetime import datetime
 
 INTERFACE = "wlp194s0"
@@ -12,8 +14,9 @@ CHECK_URL = "http://connectivity-check.ubuntu.com"
 CHECK_TIMEOUT = 5
 CHECK_INTERVAL = 10
 FAIL_THRESHOLD = 2
-SUCCESS_THRESHOLD = 3
 STABILIZE_WAIT = 15
+FREEZE_TTL_S = 30.0
+NET_STATE_PATH = "/run/texbot/net_state.json"
 NETWORKS = [
     "Ventura's Home_EXT",
     "Redmi 9A",
@@ -74,15 +77,57 @@ def switch_network(ssid: str) -> bool:
     return result.returncode == 0
 
 
+def read_net_state_file(path: str = NET_STATE_PATH) -> dict | None:
+    """Load the coordination flag; None if missing/unreadable."""
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def is_freeze_active(state: dict | None) -> bool:
+    """FROZEN flag within TTL blocks switching."""
+    if not state:
+        return False
+    if state.get("owner") != "texbot":
+        return False
+    if state.get("mode") != "FROZEN":
+        return False
+    ts = state.get("ts")
+    if ts is None:
+        return False
+    now = time.time()
+    return (now - ts) < FREEZE_TTL_S
+
+
+def write_wifi_state(ssid: str, path: str = NET_STATE_PATH) -> None:
+    """Publish our current stable state for the bot's re-entry gate."""
+    try:
+        existing = read_net_state_file(path) or {}
+        existing["wifi"] = {
+            "state": f"stable-on:{ssid}",
+            "ts": time.time(),
+        }
+        # Atomic write (write to tmp, then rename) to avoid partial reads
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(existing, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        log("ERROR", f"write_wifi_state failed: {e}")
+
+
 def main() -> None:
     current = get_current_network()
     log("INFO", f"Avviato su {current!r}")
 
     failure_count = 0
-    success_count = 0
 
     while True:
         ok = check_connectivity()
+        state = read_net_state_file()
+        frozen = is_freeze_active(state)
 
         try:
             current_idx = NETWORKS.index(current)
@@ -91,34 +136,14 @@ def main() -> None:
 
         if ok:
             failure_count = 0
-            success_count += 1
-            log("INFO", f"Connettività OK su {current!r} (success #{success_count})")
-
-            if current_idx > 0:
-                available = get_available_networks()
-                better = next(
-                    (n for n in NETWORKS[:current_idx] if n in available), None
-                )
-                if better and success_count >= SUCCESS_THRESHOLD:
-                    log("INFO",
-                        f"Success #{success_count} su {current!r} — "
-                        f"{better!r} in range, switch up")
-                    if switch_network(better):
-                        current = better
-                        log("INFO", f"Connesso a {current!r} — monitoraggio attivo")
-                    else:
-                        log("ERROR", f"nmcli connect a {better!r} fallito")
-                    failure_count = 0
-                    success_count = 0
-                    time.sleep(STABILIZE_WAIT)
-                    continue
+            log("INFO", f"Connettività OK su {current!r}")
+            # NO switch-up logic. Stay on current unless it fails.
 
         else:
-            success_count = 0
             failure_count += 1
             log("WARN", f"Fail #{failure_count} su {current!r}")
 
-            if failure_count >= FAIL_THRESHOLD:
+            if failure_count >= FAIL_THRESHOLD and not frozen:
                 available = get_available_networks()
                 candidates = NETWORKS[current_idx + 1:] if current_idx < len(NETWORKS) else NETWORKS
                 target = next((n for n in candidates if n in available), None)
@@ -131,12 +156,15 @@ def main() -> None:
                     else:
                         log("ERROR", f"nmcli connect a {target!r} fallito")
                     failure_count = 0
-                    success_count = 0
                     time.sleep(STABILIZE_WAIT)
+                    write_wifi_state(current)
                     continue
                 else:
                     log("ERROR", "Nessuna rete fallback disponibile")
+            elif frozen:
+                log("INFO", "FROZEN flag active; skipping switch")
 
+        write_wifi_state(current)
         time.sleep(CHECK_INTERVAL)
 
 
