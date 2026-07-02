@@ -124,6 +124,9 @@ def pick_fallback(
 def write_wifi_state(ssid: str, path: str = NET_STATE_PATH) -> None:
     """Publish our current stable state for the bot's re-entry gate."""
     try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
         existing = read_net_state_file(path) or {}
         existing["wifi"] = {
             "state": f"stable-on:{ssid}",

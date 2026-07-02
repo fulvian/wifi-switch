@@ -460,6 +460,7 @@ class TestWriteWifiState:
 
     def test_uses_atomic_write(self):
         with patch("builtins.open", mock_open()), \
+             patch("os.makedirs"), \
              patch("os.replace") as mock_replace:
             ws.write_wifi_state("Redmi 9A", path="/fake/path.json")
         # Verify that os.replace was called (atomic write pattern)
