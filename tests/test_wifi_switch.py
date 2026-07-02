@@ -266,6 +266,116 @@ class TestMainLoop:
         assert call_args[0][0] == "Redmi 9A"
 
 
+class TestPickFallback:
+    NOW = 1000.0
+
+    def test_returns_none_when_no_other_network_available(self):
+        assert ws.pick_fallback(
+            "Ventura's Home_EXT", ["Ventura's Home_EXT"], {}, self.NOW
+        ) is None
+
+    def test_excludes_current_network(self):
+        # only current in scan → nothing to switch to
+        assert ws.pick_fallback("Redmi 9A", ["Redmi 9A"], {}, self.NOW) is None
+
+    def test_prefers_priority_order_among_fresh(self):
+        # both fresh → Ventura (idx 0) wins over Redmi (idx 1)
+        result = ws.pick_fallback(
+            "POCO X6 5G di Fulvio",
+            ["Ventura's Home_EXT", "Redmi 9A"],
+            {},
+            self.NOW,
+        )
+        assert result == "Ventura's Home_EXT"
+
+    def test_skips_network_in_cooldown(self):
+        # Ventura in cooldown → pick next fresh (Redmi)
+        result = ws.pick_fallback(
+            "POCO X6 5G di Fulvio",
+            ["Ventura's Home_EXT", "Redmi 9A"],
+            {"Ventura's Home_EXT": self.NOW + 100},
+            self.NOW,
+        )
+        assert result == "Redmi 9A"
+
+    def test_expired_cooldown_is_fresh_again(self):
+        result = ws.pick_fallback(
+            "POCO X6 5G di Fulvio",
+            ["Ventura's Home_EXT"],
+            {"Ventura's Home_EXT": self.NOW - 1},
+            self.NOW,
+        )
+        assert result == "Ventura's Home_EXT"
+
+    def test_all_in_cooldown_picks_soonest_to_expire(self):
+        # both cooling down → pick the one that failed longest ago (soonest expiry)
+        result = ws.pick_fallback(
+            "POCO X6 5G di Fulvio",
+            ["Ventura's Home_EXT", "Redmi 9A"],
+            {"Ventura's Home_EXT": self.NOW + 200, "Redmi 9A": self.NOW + 50},
+            self.NOW,
+        )
+        assert result == "Redmi 9A"
+
+    def test_recovers_upward_from_lowest_network(self):
+        # on lowest-priority POCO, it fails → can still reach higher networks
+        result = ws.pick_fallback(
+            "POCO X6 5G di Fulvio",
+            ["Redmi 9A", "POCO X6 5G di Fulvio"],
+            {},
+            self.NOW,
+        )
+        assert result == "Redmi 9A"
+
+
+class TestMainManualAndCooldown:
+    def test_adopts_manual_switch_and_does_not_leave_it(self):
+        """User manually on POCO; daemon started thinking Ventura. One transient
+        failure must not drag them off POCO before FAIL_THRESHOLD, and re-sync
+        must adopt POCO as current."""
+        with patch("wifi_switch.get_current_network",
+                   return_value="POCO X6 5G di Fulvio"), \
+             patch("wifi_switch.check_connectivity", return_value=True), \
+             patch("wifi_switch.read_net_state_file", return_value=None), \
+             patch("wifi_switch.switch_network") as mock_switch, \
+             patch("wifi_switch.write_wifi_state") as mock_write, \
+             patch("time.sleep", side_effect=[StopIteration()]):
+            try:
+                ws.main()
+            except StopIteration:
+                pass
+        mock_switch.assert_not_called()
+        assert mock_write.call_args[0][0] == "POCO X6 5G di Fulvio"
+
+    def test_failed_network_goes_into_cooldown_not_reselected(self):
+        """Ventura fails → switch to Redmi. When Redmi later fails, Ventura is
+        still in cooldown so POCO is chosen instead of flapping back to Ventura."""
+        # get_current_network reflects the daemon's own switches via a sequence:
+        # start=Ventura, loop1..2=Ventura, after switch loop3=Redmi, loop4=Redmi
+        current_seq = [
+            "Ventura's Home_EXT",  # startup read
+            "Ventura's Home_EXT",  # loop1 re-sync
+            "Ventura's Home_EXT",  # loop2 re-sync
+            "Redmi 9A",            # loop3 re-sync (adopts daemon switch)
+            "Redmi 9A",            # loop4 re-sync
+        ]
+        with patch("wifi_switch.get_current_network", side_effect=current_seq), \
+             patch("wifi_switch.check_connectivity",
+                   side_effect=[False, False, False, False]), \
+             patch("wifi_switch.read_net_state_file", return_value=None), \
+             patch("wifi_switch.get_available_networks",
+                   return_value=["Ventura's Home_EXT", "Redmi 9A", "POCO X6 5G di Fulvio"]), \
+             patch("wifi_switch.switch_network", return_value=True) as mock_switch, \
+             patch("wifi_switch.write_wifi_state"), \
+             patch("time.sleep", side_effect=[None, None, None, StopIteration()]):
+            try:
+                ws.main()
+            except StopIteration:
+                pass
+        targets = [c[0][0] for c in mock_switch.call_args_list]
+        assert targets == ["Redmi 9A", "POCO X6 5G di Fulvio"]
+
+
 class TestReadNetStateFile:
     def test_returns_dict_when_file_exists(self):
         data = {"owner": "texbot", "mode": "FROZEN", "ts": 123.45}

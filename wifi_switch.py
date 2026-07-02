@@ -15,6 +15,7 @@ CHECK_TIMEOUT = 5
 CHECK_INTERVAL = 10
 FAIL_THRESHOLD = 2
 STABILIZE_WAIT = 15
+COOLDOWN_S = 300.0
 FREEZE_TTL_S = 30.0
 NET_STATE_PATH = "/run/texbot/net_state.json"
 NETWORKS = [
@@ -101,6 +102,25 @@ def is_freeze_active(state: dict | None) -> bool:
     return (now - ts) < FREEZE_TTL_S
 
 
+def pick_fallback(
+    current: str, available: list[str], cooldown: dict[str, float], now: float
+) -> str | None:
+    """Choose a network to switch to when `current` failed connectivity.
+
+    Candidates = every known network except `current` that is currently in scan.
+    Prefer candidates NOT in cooldown, iterated in NETWORKS priority order. If all
+    candidates are in cooldown, fall back to the one whose cooldown expires soonest
+    (i.e. failed longest ago) — being on something beats being on a dead link.
+    """
+    candidates = [n for n in NETWORKS if n != current and n in available]
+    if not candidates:
+        return None
+    fresh = [n for n in candidates if cooldown.get(n, 0.0) <= now]
+    if fresh:
+        return fresh[0]
+    return min(candidates, key=lambda n: cooldown.get(n, 0.0))
+
+
 def write_wifi_state(ssid: str, path: str = NET_STATE_PATH) -> None:
     """Publish our current stable state for the bot's re-entry gate."""
     try:
@@ -123,19 +143,25 @@ def main() -> None:
     log("INFO", f"Avviato su {current!r}")
 
     failure_count = 0
+    cooldown: dict[str, float] = {}
 
     while True:
+        # Re-sync with reality first: the user (or NM autoconnect) may have
+        # switched networks manually. Honour that choice instead of dragging
+        # them off it on the next failure via a stale `current`.
+        actual = get_current_network()
+        if actual and actual != current:
+            log("INFO", f"Cambio rete rilevato: {current!r} → {actual!r} (manuale)")
+            current = actual
+            failure_count = 0
+
         ok = check_connectivity()
         state = read_net_state_file()
         frozen = is_freeze_active(state)
 
-        try:
-            current_idx = NETWORKS.index(current)
-        except ValueError:
-            current_idx = len(NETWORKS)
-
         if ok:
             failure_count = 0
+            cooldown.pop(current, None)
             log("INFO", f"Connettività OK su {current!r}")
             # NO switch-up logic. Stay on current unless it fails.
 
@@ -144,12 +170,15 @@ def main() -> None:
             log("WARN", f"Fail #{failure_count} su {current!r}")
 
             if failure_count >= FAIL_THRESHOLD and not frozen:
+                now = time.time()
+                cooldown[current] = now + COOLDOWN_S
                 available = get_available_networks()
-                candidates = NETWORKS[current_idx + 1:] if current_idx < len(NETWORKS) else NETWORKS
-                target = next((n for n in candidates if n in available), None)
+                target = pick_fallback(current, available, cooldown, now)
                 if target:
+                    demoted = cooldown.get(target, 0.0) > now
                     log("WARN",
-                        f"Fail #{failure_count} — switch a {target!r}")
+                        f"Fail #{failure_count} — switch a {target!r}"
+                        f"{' (tutte in cooldown, ultima scelta)' if demoted else ''}")
                     if switch_network(target):
                         current = target
                         log("INFO", f"Connesso a {current!r} — monitoraggio attivo")
